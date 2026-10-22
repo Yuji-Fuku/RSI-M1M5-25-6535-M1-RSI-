@@ -1,0 +1,284 @@
+//@version=5
+strategy("MTF RSI EA Idea3 (Strategy)", overlay=true, pyramiding=20, initial_capital=1000000, default_qty_type=strategy.fixed, currency=currency.JPY, process_orders_on_close=true, calc_on_every_tick=false)
+
+//==============================================================================
+// 1. パラメータ設定
+//==============================================================================
+string grp_lot = "=== ロット・分割エントリー設定 ==="
+float  Lots              = input.float(0.3, "1ポジ目（初回）のロット数", minval=0.01, step=0.01, group=grp_lot)
+string Lot_Progression   = input.string("加算（等差）", "ロット増加方式", options=["加算（等差）", "乗算（倍率）", "個別指定"], group=grp_lot, tooltip="・加算（等差）：1段ごとに指定ロットずつ増やします（例: 0.3 → 0.4 → 0.5...）\n・乗算（倍率）：1段ごとに指定倍率を掛けます（例: 0.3 × 1.5倍...）\n・個別指定：下の個別設定欄のロット数をそのまま使用します。")
+float  Lot_Add_Step      = input.float(0.1, "【加算用】1段ごとの追加ロット数 (+)", minval=0.0, step=0.01, group=grp_lot, tooltip="「加算（等差）」選択時に有効。0.1なら 0.3, 0.4, 0.5, 0.6, 0.7ロットになります。")
+float  Lot_Multiplier    = input.float(1.5, "【乗算用】追加ポジのロット倍率 (×)", minval=0.1, step=0.1, group=grp_lot, tooltip="「乗算（倍率）」選択時に有効。1.5なら前段の1.5倍ずつロットが増えます。")
+float  Custom_Lot_2      = input.float(0.4, "【個別指定用】2ポジ目のロット", minval=0.01, step=0.01, group=grp_lot)
+float  Custom_Lot_3      = input.float(0.5, "【個別指定用】3ポジ目のロット", minval=0.01, step=0.01, group=grp_lot)
+float  Custom_Lot_4      = input.float(0.7, "【個別指定用】4ポジ目のロット", minval=0.01, step=0.01, group=grp_lot)
+float  Custom_Lot_5      = input.float(1.0, "【個別指定用】5ポジ目以降のロット", minval=0.01, step=0.01, group=grp_lot)
+
+float  Lot_Currency_Unit = input.float(100000.0, "1ロットあたりの通貨単位 (MT4標準=100,000)", minval=1.0, group=grp_lot, tooltip="MT4の0.1ロット＝10,000通貨として損益計算する場合は100000に設定してください。")
+int    Max_Positions     = input.int(5, "最大分割回数（初回含め最大ポジション数）", minval=1, maxval=20, group=grp_lot)
+float  Grid_Step_Points  = input.float(20.0, "分割エントリー間隔（ポイント ※20pt = 2.0pips）", minval=1.0, group=grp_lot)
+string Grid_Exec_Mode    = input.string("全段グリッド指値", "分割エントリー約定方式", options=["全段グリッド指値", "1段ずつ指値", "足確定・成行判定"], group=grp_lot, tooltip="・全段グリッド指値：1本の足で複数段逆行した場合も各指定価格で約定させます。\n・1段ずつ指値：1本の足につき最大1回ずつ指値で追加エントリーします。\n・足確定・成行判定：指値を使わず足確定時の価格でナンピン・一括決済を判定します。")
+
+string grp_tpsl = "=== 利確・損切り設定（ポイント単位） ==="
+float TakeProfit_Points = input.float(30.0, "一括利確：平均建値からのプラス幅（30pt = 3.0pips）", minval=0.0, group=grp_tpsl)
+float StopLoss_Points   = input.float(200.0, "一括損切：初回1ポジ目の建値からの逆行幅（200pt = 20.0pips）", minval=0.0, group=grp_tpsl)
+bool  Entry_On_Tick     = input.bool(true, "シグナル発生足で即時初回エントリー (false=次足で判定)", group=grp_tpsl)
+
+string grp_time = "=== 時間帯フィルター設定 ==="
+bool   Use_Time_Filter   = input.bool(true, "早朝の取引停止フィルターを有効にする (05:15〜08:00)", group=grp_time)
+string No_Trade_Session  = input.session("0515-0800", "取引停止時間帯", group=grp_time, tooltip="指定した時間帯（デフォルトは05:15〜08:00）は新規エントリーおよび追加ナンピンを行いません。")
+string Time_Zone         = input.string("Asia/Tokyo", "タイムゾーン", group=grp_time, tooltip="日本時間基準の場合は Asia/Tokyo を指定してください。")
+bool   Close_In_NoTrade  = input.bool(false, "取引停止時間に入ったら保有ポジションを強制決済する", group=grp_time, tooltip="ONにすると5:15になった時点で保有中のポジションをすべて成行決済します。OFFの場合は新規エントリーと追加ナンピンのみを停止し、保有中ポジションのTP/SL監視は継続します。")
+bool   Show_NoTrade_Bg   = input.bool(true, "取引停止時間帯の背景をハイライト表示", group=grp_time)
+
+string grp_ind = "=== インジケーター条件設定（アイデア3） ==="
+int   RSI_Period        = input.int(14, "RSI計算期間", minval=1, group=grp_ind)
+float Upper_Level       = input.float(65.0, "M5 高値圏レベル", group=grp_ind)
+float Lower_Level       = input.float(35.0, "M5 安値圏レベル", group=grp_ind)
+float M1_Upper_Extreme  = input.float(75.0, "【アイデア3】M1 高値圏の到達必須レベル（深さ）", group=grp_ind)
+float M1_Lower_Extreme  = input.float(25.0, "【アイデア3】M1 安値圏の到達必須レベル（深さ）", group=grp_ind)
+int   Filter_Period     = input.int(75, "ボラティリティ比較期間（過去何本分か）", minval=1, group=grp_ind)
+int   Filter_Rank       = input.int(35, "サイズ上位何位以内か", minval=1, group=grp_ind)
+bool  Draw_Arrows       = input.bool(true, "初回エントリー箇所に矢印を描画するか", group=grp_ind)
+bool  Draw_Target_Lines = input.bool(true, "平均建値・利確・損切ラインをチャートに表示するか", group=grp_ind)
+
+//==============================================================================
+// 2. 単位・ロット計算関数 ＆ 時間帯判定
+//==============================================================================
+// 3桁・5桁ブローカーの1ポイント(0.1pip)を基準に設定
+float ptUnit    = (syminfo.mintick == 0.001 or syminfo.mintick == 0.00001) ? syminfo.mintick : syminfo.mintick / 10.0
+float tp_dist   = TakeProfit_Points * ptUnit
+float sl_dist   = StopLoss_Points   * ptUnit
+float step_dist = Grid_Step_Points  * ptUnit
+
+// ロット数の正規化と通貨単位への換算
+calcOrderQty(float lots) =>
+    float normLots = math.max(math.round(lots, 2), 0.01)
+    normLots * Lot_Currency_Unit
+
+// 何ポジ目（posNum: 1〜Max_Positions）かに応じた発注数量（通貨単位）を返す関数
+getStageQty(int posNum) =>
+    float targetLots = Lots
+    if posNum <= 1
+        targetLots := Lots
+    else if Lot_Progression == "加算（等差）"
+        targetLots := Lots + Lot_Add_Step * (posNum - 1)
+    else if Lot_Progression == "乗算（倍率）"
+        targetLots := Lots * math.pow(Lot_Multiplier, posNum - 1)
+    else
+        // 個別指定モード
+        targetLots := posNum == 2 ? Custom_Lot_2 : posNum == 3 ? Custom_Lot_3 : posNum == 4 ? Custom_Lot_4 : Custom_Lot_5
+    calcOrderQty(targetLots)
+
+// 取引停止時間帯（05:15〜08:00）の判定（全曜日対象: 1234567）
+bool isNoTradeTime  = Use_Time_Filter and not na(time(timeframe.period, No_Trade_Session + ":1234567", Time_Zone))
+bool isTradeAllowed = not isNoTradeTime
+
+//==============================================================================
+// 3. ボラティリティフィルター ＆ M5/M1 RSI シグナル判定
+//==============================================================================
+// (A) ボラティリティフィルター（過去Filter_Period本の中で現在の足サイズが上位Filter_Rank位以内か）
+bool isVolatilityTop = false
+if bar_index >= Filter_Period + 5
+    int rank = 1
+    float current_size = high - low
+    for j = 0 to Filter_Period - 1
+        float past_size = high[j] - low[j]
+        if past_size > current_size
+            rank += 1
+    if rank <= Filter_Rank
+        isVolatilityTop := true
+
+// (B) M5 RSI と M1 RSI の取得
+float rsi_chart = ta.rsi(close, RSI_Period)
+[m5_now_sec, m5_prev_sec] = request.security(syminfo.tickerid, "5", [rsi_chart, rsi_chart[1]])
+float m5_now  = timeframe.period == "5" ? rsi_chart    : m5_now_sec
+float m5_prev = timeframe.period == "5" ? rsi_chart[1] : m5_prev_sec
+
+// 現在のバーに含まれる1分足RSIの配列を取得
+array<float> m1_rsi_arr = request.security_lower_tf(syminfo.tickerid, "1", rsi_chart)
+var float prev_bar_last_m1_rsi = na
+
+bool cross_up   = false
+bool cross_down = false
+
+if timeframe.in_seconds() <= 60
+    // 1分足チャート表示時
+    float m1_now  = rsi_chart
+    float m1_prev = rsi_chart[1]
+    float m5_at_m1_prev = timeframe.change("5") ? m5_prev : m5_now
+
+    if not na(m1_now) and not na(m1_prev) and not na(m5_now)
+        if m1_prev <= m5_at_m1_prev and m1_now > m5_now and m1_now >= M1_Upper_Extreme
+            cross_up := true
+        if m1_prev >= m5_at_m1_prev and m1_now < m5_now and m1_now <= M1_Lower_Extreme
+            cross_down := true
+else
+    // 5分足チャート表示時（5分足内の各1分足をループ判定）
+    int arr_size = array.size(m1_rsi_arr)
+    if arr_size > 0 and not na(m5_now) and not na(m5_prev)
+        for i = 0 to arr_size - 1
+            float m1_s = array.get(m1_rsi_arr, i)
+            float m1_s_prev = (i == 0) ? prev_bar_last_m1_rsi : array.get(m1_rsi_arr, i - 1)
+            float m5_compare_prev = (i == 0) ? m5_prev : m5_now
+
+            if not na(m1_s) and not na(m1_s_prev)
+                if m1_s_prev <= m5_compare_prev and m1_s > m5_now and m1_s >= M1_Upper_Extreme
+                    cross_up := true
+                if m1_s_prev >= m5_compare_prev and m1_s < m5_now and m1_s <= M1_Lower_Extreme
+                    cross_down := true
+
+        prev_bar_last_m1_rsi := array.get(m1_rsi_arr, arr_size - 1)
+
+// 初回エントリーシグナル（売り優先、else ifで買い）※取引許可時間帯のみ有効
+bool raw_sell_sig = isVolatilityTop and (m5_now >= Upper_Level) and cross_up
+bool raw_buy_sig  = isVolatilityTop and (m5_now <= Lower_Level) and cross_down
+
+bool sell_signal = isTradeAllowed and (Entry_On_Tick ? raw_sell_sig : raw_sell_sig[1])
+bool buy_signal  = isTradeAllowed and (Entry_On_Tick ? raw_buy_sig  : raw_buy_sig[1])
+
+//==============================================================================
+// 4. ポジション管理・分割エントリー（ナンピン）・一括決済処理
+//==============================================================================
+// 同一バー内で初回ポジ(Grid_1)が利確/損切された後に未約定のナンピン指値のみ刺さった場合の孤立防止ガード
+if strategy.opentrades > 0 and strategy.opentrades.entry_id(0) != "Grid_1"
+    strategy.close_all(comment="Cancel_Orphan")
+    strategy.cancel_all()
+
+int   posCount       = strategy.opentrades
+bool  inLong         = strategy.position_size > 0
+bool  inShort        = strategy.position_size < 0
+float firstOpenPrice = posCount > 0 ? strategy.opentrades.entry_price(0) : na
+float lastOpenPrice  = posCount > 0 ? strategy.opentrades.entry_price(posCount - 1) : na
+float avgOpenPrice   = posCount > 0 ? strategy.position_avg_price : na
+
+float tpPrice = na
+float slPrice = na
+bool  arrow_sell = false
+bool  arrow_buy  = false
+
+// --- A. ポジション保有中の処理 ---
+if posCount > 0
+    // 取引停止時間に突入した際の強制決済オプションがONの場合
+    if isNoTradeTime and Close_In_NoTrade
+        strategy.close_all(comment="NoTradeTime_Close")
+        strategy.cancel_all()
+    else
+        if inLong
+            tpPrice := TakeProfit_Points > 0 ? avgOpenPrice + tp_dist   : na
+            slPrice := StopLoss_Points > 0   ? firstOpenPrice - sl_dist : na
+        else if inShort
+            tpPrice := TakeProfit_Points > 0 ? avgOpenPrice - tp_dist   : na
+            slPrice := StopLoss_Points > 0   ? firstOpenPrice + sl_dist : na
+
+        if Grid_Exec_Mode == "足確定・成行判定"
+            // (1) 一括決済判定
+            bool shouldClose = false
+            if inLong
+                if (not na(tpPrice) and close >= tpPrice) or (not na(slPrice) and close <= slPrice)
+                    shouldClose := true
+            else if inShort
+                if (not na(tpPrice) and close <= tpPrice) or (not na(slPrice) and close >= slPrice)
+                    shouldClose := true
+
+            if shouldClose
+                strategy.close_all(comment="Basket_Close")
+            else if posCount < Max_Positions and isTradeAllowed
+                // (2) 20ポイント逆行ごとの追加エントリー判定（段階的ロット増加）
+                int    nextPosNum = posCount + 1
+                float  nextQty    = getStageQty(nextPosNum)
+                string nextId     = "Grid_" + str.tostring(nextPosNum)
+                if inLong
+                    float nextEntryPrice = lastOpenPrice - step_dist
+                    if close <= nextEntryPrice and (na(slPrice) or close > slPrice)
+                        strategy.entry(nextId, strategy.long, qty=nextQty, comment=nextId)
+                else if inShort
+                    float nextEntryPrice = lastOpenPrice + step_dist
+                    if close >= nextEntryPrice and (na(slPrice) or close < slPrice)
+                        strategy.entry(nextId, strategy.short, qty=nextQty, comment=nextId)
+        else
+            // 指値・逆指値モード（ヒゲでのTP/SL・ナンピン約定を再現）
+            // 全ポジションに共通の平均建値TP・初回建値SLを設定して一括決済
+            for i = 1 to Max_Positions
+                string id = "Grid_" + str.tostring(i)
+                strategy.exit("Exit_" + str.tostring(i), from_entry=id, limit=tpPrice, stop=slPrice, comment_profit="TP_All", comment_loss="SL_All")
+
+            // 未約定のナンピン指値を一旦リセットして再配置
+            for i = posCount + 1 to Max_Positions
+                strategy.cancel("Grid_" + str.tostring(i))
+
+            // 取引許可時間帯のみ追加のナンピン指値を発注（段階的ロット増加）
+            if posCount < Max_Positions and isTradeAllowed
+                int max_loop = (Grid_Exec_Mode == "1段ずつ指値") ? (posCount + 1) : Max_Positions
+                for k = posCount + 1 to max_loop
+                    int    steps   = k - posCount
+                    float  nextQty = getStageQty(k)
+                    string nextId  = "Grid_" + str.tostring(k)
+
+                    if inLong
+                        float nextEntryPrice = lastOpenPrice - step_dist * steps
+                        if na(slPrice) or nextEntryPrice > slPrice
+                            strategy.entry(nextId, strategy.long, qty=nextQty, limit=nextEntryPrice, comment=nextId)
+                    else if inShort
+                        float nextEntryPrice = lastOpenPrice + step_dist * steps
+                        if na(slPrice) or nextEntryPrice < slPrice
+                            strategy.entry(nextId, strategy.short, qty=nextQty, limit=nextEntryPrice, comment=nextId)
+
+// --- B. ポジションが0のとき：初回エントリーのシグナル判定 ---
+else
+    strategy.cancel_all()
+    float initQty = getStageQty(1) // 1ポジ目（0.3ロット）
+
+    // 1. 高値圏シグナル（売りエントリー）
+    if sell_signal
+        strategy.entry("Grid_1", strategy.short, qty=initQty, comment="Grid_1")
+        arrow_sell := true
+
+        // エントリー直後の次足ヒゲでTP/SLやナンピンに到達した場合に備えて予約発注
+        if Grid_Exec_Mode != "足確定・成行判定"
+            float initTp = TakeProfit_Points > 0 ? close - tp_dist : na
+            float initSl = StopLoss_Points > 0   ? close + sl_dist : na
+            for i = 1 to Max_Positions
+                strategy.exit("Exit_" + str.tostring(i), from_entry="Grid_" + str.tostring(i), limit=initTp, stop=initSl, comment_profit="TP_All", comment_loss="SL_All")
+
+            if Max_Positions >= 2
+                int max_loop = (Grid_Exec_Mode == "1段ずつ指値") ? 2 : Max_Positions
+                for k = 2 to max_loop
+                    int   steps     = k - 1
+                    float nextQty   = getStageQty(k)
+                    float nextPrice = close + step_dist * steps
+                    if na(initSl) or nextPrice < initSl
+                        strategy.entry("Grid_" + str.tostring(k), strategy.short, qty=nextQty, limit=nextPrice, comment="Grid_" + str.tostring(k))
+
+    // 2. 安値圏シグナル（買いエントリー）
+    else if buy_signal
+        strategy.entry("Grid_1", strategy.long, qty=initQty, comment="Grid_1")
+        arrow_buy := true
+
+        // エントリー直後の次足ヒゲでTP/SLやナンピンに到達した場合に備えて予約発注
+        if Grid_Exec_Mode != "足確定・成行判定"
+            float initTp = TakeProfit_Points > 0 ? close + tp_dist : na
+            float initSl = StopLoss_Points > 0   ? close - sl_dist : na
+            for i = 1 to Max_Positions
+                strategy.exit("Exit_" + str.tostring(i), from_entry="Grid_" + str.tostring(i), limit=initTp, stop=initSl, comment_profit="TP_All", comment_loss="SL_All")
+
+            if Max_Positions >= 2
+                int max_loop = (Grid_Exec_Mode == "1段ずつ指値") ? 2 : Max_Positions
+                for k = 2 to max_loop
+                    int   steps     = k - 1
+                    float nextQty   = getStageQty(k)
+                    float nextPrice = close - step_dist * steps
+                    if na(initSl) or nextPrice > initSl
+                        strategy.entry("Grid_" + str.tostring(k), strategy.long, qty=nextQty, limit=nextPrice, comment="Grid_" + str.tostring(k))
+
+//==============================================================================
+// 5. チャートへのシグナル矢印・ターゲットライン・背景描画
+//==============================================================================
+bgcolor(Show_NoTrade_Bg and isNoTradeTime ? color.new(color.gray, 85) : na, title="取引停止時間帯背景")
+
+plotshape(Draw_Arrows and arrow_sell, title="初回売りサイン", style=shape.arrowdown, location=location.abovebar, color=color.aqua,    size=size.normal)
+plotshape(Draw_Arrows and arrow_buy,  title="初回買いサイン", style=shape.arrowup,   location=location.belowbar, color=color.fuchsia, size=size.normal)
+
+plot(Draw_Target_Lines and posCount > 0 ? avgOpenPrice : na, title="平均建値 (Avg)", color=color.white, style=plot.style_linebr, linewidth=1)
+plot(Draw_Target_Lines and posCount > 0 ? tpPrice      : na, title="利確ライン (TP)", color=color.lime,  style=plot.style_linebr, linewidth=2)
+plot(Draw_Target_Lines and posCount > 0 ? slPrice      : na, title="損切ライン (SL)", color=color.red,   style=plot.style_linebr, linewidth=2)
